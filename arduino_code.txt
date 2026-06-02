@@ -1,0 +1,171 @@
+/*
+  Fully Enhanced RS775 Monitoring System
+  Optimized for 0.96" OLED Space, Audio Siren, and Non-Blocking LED Flicker Alarm
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Pin Definitions
+const int POT_PIN = 32;          
+const int VOLTAGE_PIN = 34;      
+const int IBT2_R_IS_PIN = 35;    
+const int RPWM_PIN = 25;         
+const int LPWM_PIN = 26;         
+const int BUZZER_PIN = 13;       
+const int ALARM_LED_PIN = 12;    // <-- NEW: Connected to emergency LED
+
+// PWM Configuration
+const int PWM_FREQ = 20000;      
+const int PWM_RESOLUTION = 8;    
+const int RPWM_CHANNEL = 0;
+const int LPWM_CHANNEL = 1;
+
+// Calibration Constants
+const float ADC_REF_VOLTAGE = 3.3; 
+const int ADC_RESOLUTION = 4095;   
+const float VOLTAGE_DIVIDER_RATIO = 5.0; 
+const float IBT2_SENSITIVITY = 0.588 * 0.50; 
+
+unsigned long lastUpdateTime = 0;
+const unsigned long DISPLAY_INTERVAL = 150; 
+
+// LED/Buzzer Non-blocking Timing Variables
+unsigned long lastFlickerTime = 0;
+const unsigned long FLICKER_INTERVAL = 50; // Strobe rate in milliseconds
+bool ledState = false;
+bool anomalyActive = false;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(ALARM_LED_PIN, OUTPUT); // Initialize LED pin
+  
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(ALARM_LED_PIN, LOW);
+
+  // Set lower attenuation to boost sensitivity for low-amp signals
+  analogSetPinAttenuation(IBT2_R_IS_PIN, ADC_11db); 
+
+  ledcAttachChannel(RPWM_PIN, PWM_FREQ, PWM_RESOLUTION, RPWM_CHANNEL);
+  ledcAttachChannel(LPWM_PIN, PWM_FREQ, PWM_RESOLUTION, LPWM_CHANNEL);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
+  display.clearDisplay();
+}
+
+void loop() {
+  // 1. Read Potentiometer and Drive Motor
+  int potValue = analogRead(POT_PIN);
+  int targetPWM = map(potValue, 0, 4095, 0, 255);
+  setMotorSpeed(targetPWM, true); 
+
+  float supplyVoltage = readVoltage();
+  float motorCurrent  = readIBT2Current();
+  float powerWatts    = supplyVoltage * motorCurrent;
+  float dutyCyclePercent = (targetPWM / 255.0) * 100.0;
+
+  // 2. Check for Anomaly Commands from Python
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command == "ANOMALY_ON") {
+      anomalyActive = true;
+    } else if (command == "ANOMALY_OFF") {
+      anomalyActive = false;
+      digitalWrite(BUZZER_PIN, LOW);
+      digitalWrite(ALARM_LED_PIN, LOW); // Kill LED immediately when safe
+      noTone(BUZZER_PIN);
+    }
+  }
+
+  // 3. Non-Blocking Synchronized Siren and LED Strobe Logic
+  if (anomalyActive) {
+    // Audio Frequency Shifter
+    int toneFreq = (millis() % 400 < 200) ? 1200 : 700; 
+    tone(BUZZER_PIN, toneFreq);
+    
+    // High-Speed LED Flicker Check
+    if (millis() - lastFlickerTime >= FLICKER_INTERVAL) {
+      lastFlickerTime = millis();
+      ledState = !ledState; // Toggle LED State
+      digitalWrite(ALARM_LED_PIN, ledState ? HIGH : LOW);
+    }
+  }
+
+  // 4. Enhanced Serial and Full Screen OLED Output
+  if (millis() - lastUpdateTime >= DISPLAY_INTERVAL) {
+    lastUpdateTime = millis();
+    
+    Serial.print("V:"); Serial.print(supplyVoltage, 2);
+    Serial.print("|A:"); Serial.print(motorCurrent, 2);
+    Serial.print("|P:"); Serial.print(powerWatts, 2);
+    Serial.print("|D:"); Serial.print(dutyCyclePercent, 1);
+    Serial.println();
+
+    // Max Space OLED Layout Grid System
+    display.clearDisplay();
+    if (anomalyActive) {
+      display.fillRect(0, 0, 128, 14, WHITE);
+      display.setTextColor(BLACK);
+      display.setCursor(4, 3);
+      display.setTextSize(1);
+      display.print("!! ALARM ANOMALY !!");
+    } else {
+      display.drawRect(0, 0, 128, 14, WHITE);
+      display.setTextColor(WHITE);
+      display.setCursor(6, 3);
+      display.setTextSize(1);
+      display.print("TELEMETRY ENGINE OK");
+    }
+
+    display.drawFastHLine(0, 38, 128, WHITE);
+    display.drawFastVLine(64, 14, 24, WHITE);
+    
+    display.setTextColor(WHITE);
+    display.setTextSize(1);
+    
+    // Grid Placements
+    display.setCursor(4, 18);
+    display.print("V: "); display.print(supplyVoltage, 1); display.print("V");
+    
+    display.setCursor(70, 18);
+    display.print("I: "); display.print(motorCurrent, 2); display.print("A");
+    
+    display.setCursor(4, 44);
+    display.print("POWER: ");
+    display.setTextSize(2); 
+    display.setCursor(46, 44);
+    display.print(powerWatts, 1); display.setTextSize(1); display.print(" W");
+
+    display.setCursor(80, 55);
+    display.print("D: "); display.print(dutyCyclePercent, 0); display.print("%");
+
+    display.display();
+  }
+}
+
+void setMotorSpeed(int speed, bool forward) {
+  speed = constrain(speed, 0, 255);
+  if (forward) { ledcWrite(RPWM_PIN, speed); ledcWrite(LPWM_PIN, 0); }
+  else { ledcWrite(RPWM_PIN, 0); ledcWrite(LPWM_PIN, speed); }
+}
+
+float readVoltage() {
+  long rawADC = 0;
+  for(int i = 0; i < 10; i++) { rawADC += analogRead(VOLTAGE_PIN); }
+  return ((rawADC / 10.0) / ADC_RESOLUTION) * ADC_REF_VOLTAGE * VOLTAGE_DIVIDER_RATIO;
+}
+
+float readIBT2Current() {
+  long rawADC = 0;
+  for(int i = 0; i < 40; i++) { rawADC += analogRead(IBT2_R_IS_PIN); delayMicroseconds(50); }
+  float pinVoltage = ((rawADC / 40.0) / ADC_RESOLUTION) * ADC_REF_VOLTAGE;
+  float current = pinVoltage / IBT2_SENSITIVITY;
+  return (current < 0.08) ? 0.0 : current; 
+}
